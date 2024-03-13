@@ -1,58 +1,99 @@
 const functions = require('firebase-functions');
 const admin = require('firebase-admin');
-const axios = require('axios');
+const axios = require('axios'); // For making HTTP requests
 
-// Initialize Firebase Admin SDK
 admin.initializeApp();
+const firestore = admin.firestore();
 
-// Define the GST API endpoint and API key
-const GST_API_ENDPOINT = 'https://example.com/api/gst';
-const GST_API_KEY = 'YOUR_GST_API_KEY';
+// Retry configuration for GST API calls
+const maxRetries = 3;
+const retryDelay = 10000; // 10 seconds between retries
 
-// Define the Cloud Function to process booking documents and calculate GST
-exports.processBooking = functions.firestore
-    .document('bookings/{bookingId}')
-    .onUpdate(async (change, context) => {
-        // Get the new and previous values of the booking document
-        const newValue = change.after.data();
-        const previousValue = change.before.data();
+exports.generateInvoice = functions.firestore
+  .document('bookings/{bookingId}')
+  .onWrite(async (change, context) => {
+    const bookingData = change.after.data();
 
-        // Check if the status field has changed to 'finished'
-        if (newValue.status === 'finished' && previousValue.status !== 'finished') {
-            // Extract relevant parameters from the booking document
-            const bookingId = context.params.bookingId;
-            const name = newValue.name;
-            const totalAmount = newValue.totalBookingAmount;
+    if (bookingData.status === 'finished') {
+      const name = bookingData.name;
+      const totalAmount = bookingData.totalBookingAmount;
+      const items = bookingData.items || []; 
 
-            // Calculate GST based on the total booking amount
-            const { igst, sgstCgst } = calculateGST(totalAmount);
+      // taken 18 % GST rate
+      const gstRate = 0.18;
+      const totalGST = totalAmount * gstRate;
+      let igst, sgst, cgst;
 
-            try {
-                // Send data to GST API for automated filing
-                const response = await axios.post(GST_API_ENDPOINT, {
-                    bookingId,
-                    name,
-                    totalAmount,
-                    igst,
-                    sgstCgst,
-                    apiKey: GST_API_KEY
-                });
+      const igst = totalAmount * (gstRate / 100);
+      const sgst =  igst / 2;
+      const cgst = igst / 2; // Assuming equal split for SGST and CGST
 
-                // Log successful GST filing
-                console.log('GST filed successfully:', response.data);
-            } catch (error) {
-                // Log errors if GST filing fails
-                console.error('Error filing GST:', error);
-            }
+      const invoiceData = {
+        name,
+        totalAmount,
+        items,
+        gst: {
+          totalGST,
+          igst, 
+          sgst: sgst,
+          cgst: cgst, 
         }
+      };
+
+      // GST API Integration 
+      let response;
+      for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+          response = await sendInvoiceToGSTAPI(invoiceData);
+          break; // Exit loop on successful response
+        } catch (error) {
+          console.error(`Error generating invoice (attempt ${attempt}/${maxRetries})`, error);
+          if (attempt === maxRetries) {
+            throw error; // Re-throw error on last attempt
+          }
+          await new Promise((resolve) => setTimeout(resolve, retryDelay));
+        }
+      }
+
+      if (response.success) {
+        console.log('Invoice generated successfully!');
+        // Update booking status to "invoice generated" or similar
+        await firestore.collection('bookings').doc(context.params.bookingId).update({
+          status: 'invoice generated'
+        });
+      } else {
+        console.error('Error generating invoice:', response.error);
+        // Store error details for manual intervention
+        await storeErrorDetails(context.params.bookingId, response.error);
+      }
+    }
+  });
+
+
+async function sendInvoiceToGSTAPI(invoiceData) {
+  // This uses a placeholder URL and basic request structure
+  const gstApiUrl = 'https://your-gst-api.com/invoices';
+  const apiKey = 'your_api_key'; // to be replaced with actual API key
+
+  try {
+    const response = await axios.post(gstApiUrl, invoiceData, {
+      headers: {
+        'Authorization': `Bearer ${apiKey}`
+      }
     });
+    return response.data;
+  } catch (error) {
+    throw error;
+  }
+}
 
-// Function to calculate IGST and SGST/CGST based on total amount
-function calculateGST(totalAmount) {
-    // Placeholder implementation for GST calculation logic
-    const gstRate = 18; // Assuming a GST rate of 18%
-    const igst = totalAmount * (gstRate / 100);
-    const sgstCgst = igst / 2; // Assuming equal split for SGST and CGST
-
-    return { igst, sgstCgst };
+// Store error details for manual intervention
+async function storeErrorDetails(bookingId, error) {
+  const errorData = {
+    bookingId,
+    errorMessage: error.message,
+    errorStack: error.stack
+  };
+  
+  console.error('Storing error details:', errorData);
 }
